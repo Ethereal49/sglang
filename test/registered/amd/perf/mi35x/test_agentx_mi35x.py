@@ -1,8 +1,11 @@
-"""MI35x InferenceX AgentX curve for DeepSeek-V4.1-Flash, one point per run.
+"""MI35x InferenceX AgentX curves, one point per run.
 
-Runs one point of InferenceX's AgentX (agentic-coding) sweep
-``dsv41flash-fp4-mi355x-sglang-agentic-dspark`` against this checkout's
-sglang, so the nightly tracks the curve InferenceX publishes for MI355X.
+Runs one point of one of InferenceX's MI355X AgentX (agentic-coding) sweeps
+against this checkout's sglang, so the nightly tracks the curves InferenceX
+publishes for MI355X. nightly-benchmark-amd.yml runs these sweeps:
+
+* ``dsv41flash-fp4-mi355x-sglang-agentic-dspark`` (DeepSeek-V4.1-Flash);
+* ``qwen3.5-fp4-mi355x-sglang-agentic-mtp`` (Qwen3.5-397B-A17B MXFP4, MTP).
 
 Nothing about the point is restated here. The matrix row, the point's server
 flags and env, the golden acceptance length and the AgentX client all come from
@@ -24,13 +27,14 @@ for the same point and image. Bump INFERENCEX_COMMIT deliberately; the points
 in nightly-benchmark-amd.yml must be that commit's matrix row, which the test
 checks.
 
-nightly-benchmark-amd.yml passes the point as AGENTX_POINT (``tp2-c1``,
-``tp2-dpa-c64``, ...). The test reports rather than gates: it fails only when
+nightly-benchmark-amd.yml passes the sweep's amd-master.yaml key as
+AGENTX_CONFIG_KEY and the point as AGENTX_POINT (``tp2-c1``, ``tp2-dpa-c64``,
+...). The test reports rather than gates: it fails only when
 the server, the router or the client fails, including InferenceX's own result
 validation. The aggregate JSON and a one-row summary go to $CI_ARTIFACT_DIR,
 which the Spur launcher copies back for the workflow to upload.
 
-Registry: nightly-perf-8-gpu-mi35x-dsv41-flash-agentx suite
+Registry: nightly-perf-8-gpu-mi35x-agentx suite
 """
 
 import json
@@ -56,16 +60,14 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - one AgentX point: model load, up to an hour of warmup,
 # then InferenceX's one-hour measurement window.
-register_amd_ci(
-    est_time=10800, suite="nightly-perf-8-gpu-mi35x-dsv41-flash-agentx", nightly=True
-)
+register_amd_ci(est_time=10800, suite="nightly-perf-8-gpu-mi35x-agentx", nightly=True)
 
 INFERENCEX_REPO = "https://github.com/SemiAnalysisAI/InferenceX.git"
 INFERENCEX_COMMIT = "4538f1bc9784426ae92da31b7e8daae4ba637b84"
-CONFIG_KEY = "dsv41flash-fp4-mi355x-sglang-agentic-dspark"
 # What InferenceX's benchmark workflow sets for every AgentX point.
 THINKING_MODE = "thinking_on"
 
+CONFIG_KEY = os.environ.get("AGENTX_CONFIG_KEY", "")
 POINT = os.environ.get("AGENTX_POINT", "")
 SERVER_LAUNCH_TIMEOUT = 5400
 ROUTER_READY_TIMEOUT = 600
@@ -94,7 +96,7 @@ def _checkout_inferencex() -> Path:
 
 
 def _matrix_entry(master: dict, point: str) -> tuple:
-    """``(entry, tp, dp_attention, conc)`` for ``point`` (``tp<N>[-dpa]-c<CONC>``)."""
+    """``(scenario, entry, tp, dp_attention, conc)`` for ``point`` (``tp<N>[-dpa]-c<CONC>``)."""
     match = re.fullmatch(r"tp(\d+)(-dpa)?-c(\d+)", point)
     if not match:
         raise ValueError(
@@ -102,7 +104,7 @@ def _matrix_entry(master: dict, point: str) -> tuple:
         )
     tp, dp_attention, conc = int(match[1]), bool(match[2]), int(match[3])
     entries = [
-        entry
+        (scenario, entry)
         for scenario in master["scenarios"]["agentic-coding"]
         for entry in scenario["search-space"]
         if entry["tp"] == tp
@@ -113,12 +115,13 @@ def _matrix_entry(master: dict, point: str) -> tuple:
         raise ValueError(
             f"{point} is not one point of {CONFIG_KEY} at InferenceX {INFERENCEX_COMMIT}"
         )
-    return entries[0], tp, dp_attention, conc
+    return *entries[0], tp, dp_attention, conc
 
 
 def _bind_point(e2e: Path, point: str) -> tuple:
     """``(variant, recipe, environment)`` for ``point``, bound by InferenceX's planner."""
     sys.path.insert(0, str(e2e))
+    from infx.matrix.generate import agentic_dram_offload_gb
     from infx.matrix.validation import DEFAULT_AGENTIC_DURATION_SECONDS, srt_recipe_path
     from infx.srt_slurm.single_node import select_recipe
     from infx.srt_slurm.synthetic_acceptance import build_overrides
@@ -126,7 +129,15 @@ def _bind_point(e2e: Path, point: str) -> tuple:
 
     master = yaml.safe_load((e2e / "configs" / "amd-master.yaml").read_text())
     master = master[CONFIG_KEY]
-    entry, tp, dp_attention, conc = _matrix_entry(master=master, point=point)
+    scenario, entry, tp, dp_attention, conc = _matrix_entry(master=master, point=point)
+    # The host-DRAM budget InferenceX's matrix gives a KV-offload point; 0 otherwise.
+    total_cpu_dram_gb, _ = agentic_dram_offload_gb(
+        scenario,
+        entry,
+        master["runner"],
+        yaml.safe_load((e2e / "configs" / "runners.yaml").read_text()),
+    )
+    offload_backend = entry.get("kv-offload-backend")
     # The inputs InferenceX's benchmark template gives a single-node AgentX point.
     environment = {
         "IMAGE": master["image"],
@@ -144,6 +155,11 @@ def _bind_point(e2e: Path, point: str) -> tuple:
         "CONC": str(conc),
         "SPEC_DECODING": entry["spec-decoding"],
         "KV_OFFLOADING": entry["kv-offloading"],
+        "KV_OFFLOAD_BACKEND": offload_backend["name"] if offload_backend else "",
+        "KV_OFFLOAD_BACKEND_METADATA": (
+            json.dumps(offload_backend) if offload_backend else ""
+        ),
+        "TOTAL_CPU_DRAM_GB": str(total_cpu_dram_gb),
         "IS_AGENTIC": "1",
         "SCENARIO_TYPE": "agentic-coding",
         "IS_MULTINODE": "false",
@@ -353,9 +369,9 @@ def _write_artifacts(
         "client_exit_code": client_exit_code,
         "aggregate": aggregate,
     }
-    (artifact_dir / f"agentx-{POINT}.json").write_text(json.dumps(record))
-    (artifact_dir / f"agentx-{POINT}.md").write_text(
-        f"### DeepSeek-V4.1-Flash AgentX on MI35x: {POINT}\n\n"
+    (artifact_dir / f"agentx-{CONFIG_KEY}-{POINT}.json").write_text(json.dumps(record))
+    (artifact_dir / f"agentx-{CONFIG_KEY}-{POINT}.md").write_text(
+        f"### AgentX on MI35x: {CONFIG_KEY} {POINT}\n\n"
         + SUMMARY_HEADER
         + _summary_row(point=POINT, aggregate=aggregate)
     )
@@ -363,22 +379,25 @@ def _write_artifacts(
 
 # Not CustomTestCase: its CI retry would rerun a failed two-hour point and report
 # the second attempt's numbers as a pass.
-@unittest.skipUnless(POINT, "AGENTX_POINT is not set")
-class TestDeepSeekV41FlashAgentXMI35x(unittest.TestCase):
-    """One InferenceX AgentX point for DeepSeek-V4.1-Flash on MI35x."""
+@unittest.skipUnless(
+    CONFIG_KEY and POINT, "AGENTX_CONFIG_KEY and AGENTX_POINT are not both set"
+)
+class TestAgentXMI35x(unittest.TestCase):
+    """One InferenceX AgentX point on MI35x."""
 
     def test_agentx_point(self):
         e2e = _checkout_inferencex()
         variant, recipe, environment = _bind_point(e2e=e2e, point=POINT)
         print(
-            f"AgentX {POINT}: {variant} at InferenceX {INFERENCEX_COMMIT}", flush=True
+            f"AgentX {CONFIG_KEY} {POINT}: {variant} at InferenceX {INFERENCEX_COMMIT}",
+            flush=True,
         )
         frontend = recipe.get("frontend") or {}
         if frontend.get("type") not in ("sglang", "sglang-router"):
             raise ValueError(f"Unsupported frontend {frontend.get('type')!r}")
 
         model, served_model_name, other_args, server_env = _server_launch(recipe)
-        result_dir = Path(tempfile.mkdtemp(prefix=f"agentx-{POINT}-"))
+        result_dir = Path(tempfile.mkdtemp(prefix=f"agentx-{CONFIG_KEY}-{POINT}-"))
         result_filename = f"agentx_{CONFIG_KEY}_{POINT}"
         worker_url = DEFAULT_URL_FOR_TEST
         server = popen_launch_server(
